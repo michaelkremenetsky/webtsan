@@ -1,0 +1,11 @@
+ BUILD.gn                                       |   3 +
+ src/builtins/builtins-sharedarraybuffer-gen.cc |  12 ++
+ src/execution/futex-emulation.cc               |  33 +++-
+ src/flags/flag-definitions.h                   |   5 +
+ src/objects/backing-store.cc                   |   7 +
+ src/runtime/runtime-test-wasm.cc               | 246 ++++++++++++++++++++-----
+ src/runtime/runtime.h                          |  10 +-
+ src/wasm/baseline/liftoff-compiler.cc          |  78 ++++++--
+ src/wasm/wasm-external-refs.cc                 |  44 ++++-
+ src/wasm/wasm-tracing.h                        |   1 +
+ 10 files changed, 372 insertions(+), 67 deletions(-)

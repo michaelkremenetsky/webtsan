@@ -1,0 +1,752 @@
+diff --git a/BUILD.gn b/BUILD.gn
+index fc8e4b4cf66..3f83e70087a 100644
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -6242,6 +6242,8 @@ v8_cluster_source_set("v8_base_without_compiler") {
+     "src/runtime/runtime-symbol.cc",
+     "src/runtime/runtime-test.cc",
+     "src/runtime/runtime-trace.cc",
++    "src/runtime/runtime-tsan.cc",
++    "src/runtime/runtime-tsan.h",
+     "src/runtime/runtime-typedarray.cc",
+     "src/runtime/runtime-weak-refs.cc",
+     "src/runtime/runtime.cc",
+@@ -6904,6 +6906,7 @@ v8_cluster_source_set("v8_base_without_compiler") {
+     ]
+     deps += [ "third_party/vtune:v8_vtune_trace_mark" ]
+   }
++
+ }
+ 
+ group("v8_base") {
+diff --git a/src/builtins/builtins-sharedarraybuffer-gen.cc b/src/builtins/builtins-sharedarraybuffer-gen.cc
+index 83a97d15f38..bc31d0535d7 100644
+--- a/src/builtins/builtins-sharedarraybuffer-gen.cc
++++ b/src/builtins/builtins-sharedarraybuffer-gen.cc
+@@ -266,6 +266,9 @@ TF_BUILTIN(AtomicsLoad, SharedArrayBufferBuiltinsAssembler) {
+   // buffer to become detached.
+   CheckJSTypedArrayIndex(array, index_word, &validate_failed);
+ 
++  CallRuntime(Runtime::kWebTSanAtomicsLoad, context, array,
++              SmiTag(Signed(index_word)));
++
+   // Steps 5-10.
+   //
+   // (Not copied from ecma262 due to the axiomatic nature of the memory model.)
+@@ -372,6 +375,9 @@ TF_BUILTIN(AtomicsStore, SharedArrayBufferBuiltinsAssembler) {
+ 
+   DebugCheckAtomicIndex(array, index_word);
+ 
++  CallRuntime(Runtime::kWebTSanAtomicsStore, context, array,
++              SmiTag(Signed(index_word)));
++
+   // Steps 8-13.
+   //
+   // (Not copied from ecma262 due to the axiomatic nature of the memory model.)
+@@ -460,6 +466,9 @@ TF_BUILTIN(AtomicsExchange, SharedArrayBufferBuiltinsAssembler) {
+   TNode<UintPtrT> index_word =
+       ValidateAtomicAccess(array, index_or_field_name, context, elements_kind);
+ 
++  CallRuntime(Runtime::kWebTSanAtomicsRMW, context, array,
++              SmiTag(Signed(index_word)));
++
+ #if V8_TARGET_ARCH_MIPS64
+   TNode<Number> index_number = ChangeUintPtrToTagged(index_word);
+   Return(CallRuntime(Runtime::kAtomicsExchange, context, array, index_number,
+@@ -600,6 +609,9 @@ TF_BUILTIN(AtomicsCompareExchange, SharedArrayBufferBuiltinsAssembler) {
+   TNode<UintPtrT> index_word =
+       ValidateAtomicAccess(array, index_or_field_name, context, elements_kind);
+ 
++  CallRuntime(Runtime::kWebTSanAtomicsRMW, context, array,
++              SmiTag(Signed(index_word)));
++
+ #if V8_TARGET_ARCH_MIPS64
+   TNode<Number> index_number = ChangeUintPtrToTagged(index_word);
+   Return(CallRuntime(Runtime::kAtomicsCompareExchange, context, array,
+diff --git a/src/execution/futex-emulation.cc b/src/execution/futex-emulation.cc
+index 8dc6245779d..85025574234 100644
+--- a/src/execution/futex-emulation.cc
++++ b/src/execution/futex-emulation.cc
+@@ -20,6 +20,8 @@
+ #include "src/objects/objects-inl.h"
+ #include "src/tasks/cancelable-task.h"
+ 
++#include "src/runtime/runtime-tsan.h"
++
+ namespace v8::internal {
+ 
+ // A {FutexWaitList} manages all contexts waiting (synchronously or
+@@ -423,9 +425,19 @@ Tagged<Object> FutexEmulation::WaitSync(Isolate* isolate, void* wait_location,
+   }
+ #endif
+ 
+-  return *WaitSyncImpl<FutexWaitList, T>(isolate, wait_list, node, lock_guard,
+-                                         use_timeout, timeout_time, value,
+-                                         loaded_value, {wait_location});
++  DirectHandle<Object> result =
++      WaitSyncImpl<FutexWaitList, T>(isolate, wait_list, node, lock_guard,
++                                     use_timeout, timeout_time, value,
++                                     loaded_value, {wait_location});
++
++  if (V8_UNLIKELY(v8_flags.wasm_tsan)) {
++    uint32_t tid = web_tsan::g_callbacks.get_current_tid ? web_tsan::g_callbacks.get_current_tid() : UINT32_MAX;
++    if (tid != UINT32_MAX) {
++      web_tsan::g_callbacks.on_atomics_wait_complete(tid, wait_location);
++    }
++  }
++
++  return *result;
+ }
+ 
+ template <typename WaitList, typename T>
+@@ -672,6 +684,13 @@ int FutexEmulation::Wake(Tagged<JSArrayBuffer> array_buffer, size_t addr,
+ }
+ 
+ int FutexEmulation::Wake(void* wait_location, uint32_t num_waiters_to_wake) {
++  if (V8_UNLIKELY(v8_flags.wasm_tsan)) {
++    uint32_t tid = web_tsan::g_callbacks.get_current_tid ? web_tsan::g_callbacks.get_current_tid() : UINT32_MAX;
++    if (tid != UINT32_MAX) {
++      web_tsan::g_callbacks.on_atomics_notify(tid, wait_location);
++    }
++  }
++
+   int num_waiters_woken = 0;
+   FutexWaitList* wait_list = GetWaitList();
+   NoGarbageCollectionMutexGuard lock_guard(wait_list->mutex());
+@@ -893,6 +912,14 @@ void FutexEmulation::ResolveAsyncWaiterPromises(Isolate* isolate) {
+     DCHECK(node->IsAsync());
+     DCHECK_EQ(isolate, node->async_state_->isolate_for_async_waiters);
+     DCHECK(!node->waiting_);
++
++    if (V8_UNLIKELY(v8_flags.wasm_tsan)) {
++      uint32_t tid = web_tsan::g_callbacks.get_current_tid ? web_tsan::g_callbacks.get_current_tid() : UINT32_MAX;
++      if (tid != UINT32_MAX && node->wait_location_) {
++        web_tsan::g_callbacks.on_atomics_wait_complete(tid, node->wait_location_);
++      }
++    }
++
+     ResolveAsyncWaiterPromise(node);
+     CleanupAsyncWaiterPromise(node);
+     // We've already tried to cancel the timeout task for the node; since we're
+diff --git a/src/flags/flag-definitions.h b/src/flags/flag-definitions.h
+index a15fe4a07d4..b66f6b8cb3f 100644
+--- a/src/flags/flag-definitions.h
++++ b/src/flags/flag-definitions.h
+@@ -1995,6 +1995,11 @@ DEFINE_DEBUG_BOOL(trace_liftoff, false,
+                   "trace Liftoff, the baseline compiler for WebAssembly")
+ DEFINE_BOOL(trace_wasm_memory, false,
+             "print all memory updates performed in wasm code")
++DEFINE_BOOL(wasm_tsan, false,
++            "enable WebTSan for WASM shared memory access")
++// When wasm_tsan is enabled, disable tier-up so all WASM code stays in Liftoff
++// (which has our instrumentation hooks). TurboFan emits raw loads/stores.
++DEFINE_NEG_IMPLICATION(wasm_tsan, wasm_tier_up)
+ DEFINE_BOOL(trace_wasm_globals, false,
+             "print all global variable updates performed in wasm code")
+ // Fuzzers use {wasm_tier_mask_for_testing} and {wasm_debug_mask_for_testing}
+diff --git a/src/objects/backing-store.cc b/src/objects/backing-store.cc
+index a1ad5db0823..7ca26d62de5 100644
+--- a/src/objects/backing-store.cc
++++ b/src/objects/backing-store.cc
+@@ -22,6 +22,8 @@
+ #include "src/wasm/wasm-objects-inl.h"
+ #endif  // V8_ENABLE_WEBASSEMBLY
+ 
++#include "src/runtime/runtime-tsan.h"
++
+ #define TRACE_BS(...)                                      \
+   do {                                                     \
+     if (v8_flags.trace_backing_store) PrintF(__VA_ARGS__); \
+@@ -144,6 +146,11 @@ BackingStore::BackingStore(void* buffer_start, size_t byte_length,
+ BackingStore::~BackingStore() {
+   GlobalBackingStoreRegistry::Unregister(this);
+ 
++  if (V8_UNLIKELY(v8_flags.wasm_tsan) && is_shared() && buffer_start_ &&
++      web_tsan::g_callbacks.remove_shadow) {
++    web_tsan::g_callbacks.remove_shadow(buffer_start_);
++  }
++
+   struct ClearSharedAllocator {
+     BackingStore* const bs;
+ 
+diff --git a/src/runtime/runtime-test-wasm.cc b/src/runtime/runtime-test-wasm.cc
+index 43eaa9cb438..0a5f971dfe8 100644
+--- a/src/runtime/runtime-test-wasm.cc
++++ b/src/runtime/runtime-test-wasm.cc
+@@ -10,6 +10,7 @@
+ #include "src/base/platform/mutex.h"
+ #include "src/builtins/builtins-inl.h"
+ #include "src/execution/arguments-inl.h"
++#include "src/execution/execution.h"
+ #include "src/execution/frames-inl.h"
+ #include "src/handles/handles.h"
+ #include "src/heap/heap-inl.h"
+@@ -30,6 +31,9 @@
+ #include "src/wasm/wasm-serialization.h"
+ #include "src/wasm/wasm-tracing.h"
+ 
++#include "src/runtime/runtime-tsan.h"
++#include "src/api/api-inl.h"
++
+ namespace v8::internal {
+ 
+ namespace {
+@@ -686,59 +690,205 @@ RUNTIME_FUNCTION(Runtime_WasmTraceGlobal) {
+ }
+ 
+ RUNTIME_FUNCTION(Runtime_WasmTraceMemory) {
+-  SealHandleScope scope(isolate);
+-  if (args.length() != 1 || !IsSmi(args[0])) {
+-    return CrashUnlessFuzzing(isolate);
+-  }
+-  DisallowGarbageCollection no_gc;
+-  auto info_addr = Cast<Smi>(args[0]);
++  // Extracted fields from MemoryTracingInfo that survive past the
++  // SealHandleScope block so the tsan path can use them.
++  void* tsan_backing_store = nullptr;
++  size_t tsan_byte_length = 0;
++  uintptr_t tsan_offset = 0;
++  int tsan_mem_rep_size = 0;
++  bool tsan_is_store = false;
++  bool tsan_is_atomic = false;
++  Address tsan_native_context = kNullAddress;
++
++  {
++    SealHandleScope scope(isolate);
++    if (args.length() != 1 || !IsSmi(args[0])) {
++      return CrashUnlessFuzzing(isolate);
++    }
++    DisallowGarbageCollection no_gc;
++    auto info_addr = Cast<Smi>(args[0]);
+ 
+-  wasm::MemoryTracingInfo* info =
+-      reinterpret_cast<wasm::MemoryTracingInfo*>(info_addr.ptr());
++    wasm::MemoryTracingInfo* info =
++        reinterpret_cast<wasm::MemoryTracingInfo*>(info_addr.ptr());
+ 
+-  // Find the caller wasm frame.
+-  wasm::WasmCodeRefScope wasm_code_ref_scope;
+-  DebuggableStackFrameIterator it(isolate);
+-  DCHECK(!it.done());
+-  DCHECK(it.is_wasm());
++    // Find the caller wasm frame.
++    wasm::WasmCodeRefScope wasm_code_ref_scope;
++    DebuggableStackFrameIterator it(isolate);
++    DCHECK(!it.done());
++    DCHECK(it.is_wasm());
+ #if V8_ENABLE_DRUMBRAKE
+-  DCHECK(!it.is_wasm_interpreter_entry());
++    DCHECK(!it.is_wasm_interpreter_entry());
+ #endif  // V8_ENABLE_DRUMBRAKE
+-  WasmFrame* frame = WasmFrame::cast(it.frame());
+-
+-  wasm::ExecutionTier tier = frame->wasm_code()->tier();
+-  MachineRepresentation mem_rep =
+-      static_cast<MachineRepresentation>(info->mem_rep);
+-
+-  const Address address =
+-      reinterpret_cast<Address>(frame->trusted_instance_data()
+-                                    ->memory_object(info->mem_index)
+-                                    ->backing_store()
+-                                    ->buffer_start()) +
+-      info->offset;
+-
+-  wasm::MemoryTraceEntry trace_entry = {
+-      .offset = info->offset,
+-      .function_index = frame->function_index(),
+-      .mem_index = info->mem_index,
+-      .frame_position = frame->position(),
+-      .tier = tier,
+-      .representation = mem_rep,
+-      .is_store = static_cast<bool>(info->is_store),
+-      .value_bytes = {}};
+-  int mem_rep_size = ElementSizeInBytes(mem_rep);
+-  CHECK_GE(sizeof(trace_entry.value_bytes), mem_rep_size);
+-  memcpy(trace_entry.value_bytes, reinterpret_cast<void*>(address),
+-         mem_rep_size);
++    WasmFrame* frame = WasmFrame::cast(it.frame());
++
++    wasm::ExecutionTier tier = frame->wasm_code()->tier();
++    MachineRepresentation mem_rep =
++        static_cast<MachineRepresentation>(info->mem_rep);
++
++    const Address address =
++        reinterpret_cast<Address>(frame->trusted_instance_data()
++                                      ->memory_object(info->mem_index)
++                                      ->backing_store()
++                                      ->buffer_start()) +
++        info->offset;
++
++    wasm::MemoryTraceEntry trace_entry = {
++        .offset = info->offset,
++        .function_index = frame->function_index(),
++        .mem_index = info->mem_index,
++        .frame_position = frame->position(),
++        .tier = tier,
++        .representation = mem_rep,
++        .is_store = static_cast<bool>(info->is_store),
++        .value_bytes = {}};
++    int mem_rep_size = ElementSizeInBytes(mem_rep);
++    CHECK_GE(sizeof(trace_entry.value_bytes), mem_rep_size);
++    memcpy(trace_entry.value_bytes, reinterpret_cast<void*>(address),
++           mem_rep_size);
++
++    if (v8_flags.trace_wasm_memory) {
++      wasm::WasmTracesForTesting& traces = wasm::GetWasmTracesForTesting();
++      if (traces.should_store_trace) {
++        traces.memory_trace.push_back(trace_entry);
++      } else {
++        std::ostringstream ss;
++        PrintMemoryTraceString(trace_entry, frame->native_module(), ss);
++        ss << "\n";
++        PrintF("%s", ss.str().c_str());
++      }
++    }
+ 
+-  wasm::WasmTracesForTesting& traces = wasm::GetWasmTracesForTesting();
+-  if (traces.should_store_trace) {
+-    traces.memory_trace.push_back(trace_entry);
+-  } else {
+-    std::ostringstream ss;
+-    PrintMemoryTraceString(trace_entry, frame->native_module(), ss);
+-    ss << "\n";
+-    PrintF("%s", ss.str().c_str());
++    if (V8_UNLIKELY(v8_flags.wasm_tsan)) {
++      tsan_backing_store = frame->trusted_instance_data()
++                               ->memory_object(info->mem_index)
++                               ->backing_store()
++                               ->buffer_start();
++      tsan_byte_length = frame->trusted_instance_data()
++                             ->memory_object(info->mem_index)
++                             ->backing_store()
++                             ->byte_length();
++      tsan_offset = info->offset;
++      tsan_mem_rep_size = mem_rep_size;
++      tsan_is_store = info->is_store;
++      tsan_is_atomic = info->is_atomic;
++      // Save the native context so we can set it on the isolate outside the
++      // SealHandleScope when we need to throw a JS error.  WASM frames don't
++      // set isolate->context(), so error_function() would DCHECK-fail.
++      tsan_native_context =
++          frame->trusted_instance_data()->native_context().ptr();
++    }
++  }  // End SealHandleScope + DisallowGarbageCollection.
++
++  // WebTSan path — runs outside SealHandleScope so we can throw JS errors.
++  if (V8_UNLIKELY(v8_flags.wasm_tsan) && tsan_backing_store) {
++    // Lazily install the __webTSan* globals on the first WASM access per
++    // isolate.  This is needed for the main thread where we don't have a
++    // Blink worker-init hook.
++    static thread_local bool webtsan_globals_installed = false;
++    if (!webtsan_globals_installed &&
++        web_tsan::g_callbacks.install_webtsan_globals &&
++        tsan_native_context != kNullAddress) {
++      webtsan_globals_installed = true;
++      isolate->set_context(
++          Cast<Context>(Tagged<Object>(tsan_native_context)));
++      HandleScope hs(isolate);
++      v8::Local<v8::Context> api_context =
++          v8::Utils::ToLocal(isolate->native_context());
++      web_tsan::g_callbacks.install_webtsan_globals(
++          reinterpret_cast<v8::Isolate*>(isolate), api_context);
++    }
++    if (tsan_is_atomic) {
++      // Atomic operations are race-free by definition — don't record them in
++      // the shadow.  Dispatch to the correct hook so that sync-clock
++      // propagation uses the proper acquire/release semantics:
++      //   atomic load  → Acquire (join sync_clocks_[addr] into thread clock)
++      //   atomic store → Release (store thread clock into sync_clocks_[addr])
++      //   atomic RMW   → both
++      // `tsan_is_store` distinguishes load (false) from store/RMW (true); for
++      // RMWs liftoff-compiler sets is_store=true, so store and RMW share a path
++      // which is correct because a store's clock already dominates the prior
++      // value's clock (single-writer ordering within the atomic cell).
++      void* location =
++          static_cast<uint8_t*>(tsan_backing_store) + tsan_offset;
++      uint32_t tid = web_tsan::g_callbacks.get_current_tid
++                         ? web_tsan::g_callbacks.get_current_tid()
++                         : UINT32_MAX;
++      if (tid != UINT32_MAX) {
++        if (!tsan_is_store) {
++          if (web_tsan::g_callbacks.on_atomics_load) {
++            web_tsan::g_callbacks.on_atomics_load(tid, location);
++          }
++        } else {
++          // Treat store as a full RMW (Acquire + Release). This is the safe
++          // over-approximation: release alone would drop a prior-writer's
++          // clock that this thread never acquired, producing false positives.
++          if (web_tsan::g_callbacks.on_atomics_rmw) {
++            web_tsan::g_callbacks.on_atomics_rmw(tid, location);
++          }
++        }
++      }
++    } else if (web_tsan::g_callbacks.wasm_access) {
++      // Reentrance guard: while we're reporting a race, the console.error
++      // call itself runs JS/wasm that does SAB accesses and would recurse
++      // back into this function. Skip all access recording in that window.
++      static thread_local bool s_in_race_report = false;
++      if (s_in_race_report) return ReadOnlyRoots(isolate).undefined_value();
++
++      web_tsan::g_callbacks.wasm_access(tsan_backing_store, tsan_byte_length,
++                                        tsan_offset, tsan_mem_rep_size,
++                                        tsan_is_store);
++      // Check if the access triggered a race report and log it to the
++      // browser console (non-fatal — races don't throw, the app keeps
++      // running and the user sees the full stream of races).
++      if (web_tsan::g_callbacks.consume_race) {
++        char race_msg[512];
++        if (web_tsan::g_callbacks.consume_race(race_msg, sizeof(race_msg))) {
++          s_in_race_report = true;
++          // WASM frames don't set isolate->context(), which is needed by
++          // looking up globalThis.console.  Set it from the WASM instance's
++          // native context.
++          isolate->set_context(Cast<Context>(
++              Tagged<Object>(tsan_native_context)));
++          HandleScope handle_scope(isolate);
++          // Format msg + stack into a single string. Passing a formatted
++          // string to console.error renders the full wasm stack in devtools
++          // — passing a JS Error object often loses the stack because the
++          // error's `.stack` accessor is lazy and devtools sometimes shows
++          // only the construction site.
++          std::ostringstream combined;
++          combined << race_msg;
++          isolate->PrintCurrentStackTrace(combined);
++          std::string combined_str = combined.str();
++          Handle<String> log_str =
++              isolate->factory()
++                  ->NewStringFromUtf8(base::CStrVector(combined_str.c_str()))
++                  .ToHandleChecked();
++          DirectHandle<JSGlobalObject> global(isolate->global_object());
++          Handle<String> console_key =
++              isolate->factory()->NewStringFromAsciiChecked("console");
++          Handle<Object> console_val;
++          if (Object::GetProperty(isolate, global, console_key)
++                  .ToHandle(&console_val) &&
++              IsJSReceiver(*console_val)) {
++            Handle<JSReceiver> console = Cast<JSReceiver>(console_val);
++            Handle<String> error_key =
++                isolate->factory()->NewStringFromAsciiChecked("error");
++            Handle<Object> error_fn;
++            if (Object::GetProperty(isolate, console, error_key)
++                    .ToHandle(&error_fn) &&
++                IsCallable(*error_fn)) {
++              DirectHandle<Object> argv[] = {Cast<Object>(log_str)};
++              MaybeHandle<Object> result = Execution::Call(
++                  isolate, error_fn, console, base::VectorOf(argv));
++              if (result.is_null() && isolate->has_exception()) {
++                isolate->clear_exception();
++              }
++            }
++          }
++          s_in_race_report = false;
++        }
++      }
++    }
+   }
+ 
+   return ReadOnlyRoots(isolate).undefined_value();
+diff --git a/src/runtime/runtime.h b/src/runtime/runtime.h
+index 355f73c7fee..d088567403d 100644
+--- a/src/runtime/runtime.h
++++ b/src/runtime/runtime.h
+@@ -871,6 +871,13 @@ constexpr bool CanTriggerGC(T... properties) {
+   F(HasElementWithInterceptor, 2, 1)         \
+   F(ObjectAssignTryFastcase, 2, 1)
+ 
++#define FOR_EACH_INTRINSIC_WEB_TSAN(F, I) \
++  F(WebTSanRecordRead, 2, 1)              \
++  F(WebTSanRecordWrite, 2, 1)             \
++  F(WebTSanAtomicsLoad, 2, 1)             \
++  F(WebTSanAtomicsStore, 2, 1)            \
++  F(WebTSanAtomicsRMW, 2, 1)
++
+ #define FOR_EACH_INTRINSIC_RETURN_OBJECT_IMPL(F, I)               \
+   FOR_EACH_INTRINSIC_ARRAY(F, I)                                  \
+   FOR_EACH_INTRINSIC_ATOMICS(F, I)                                \
+@@ -904,7 +911,8 @@ constexpr bool CanTriggerGC(T... properties) {
+   IF_WASM(FOR_EACH_INTRINSIC_WASM, F, I)                          \
+   IF_WASM(FOR_EACH_INTRINSIC_WASM_TEST, F, I)                     \
+   IF_WASM_DRUMBRAKE(FOR_EACH_INTRINSIC_WASM_DRUMBRAKE_TEST, F, I) \
+-  FOR_EACH_INTRINSIC_WEAKREF(F, I)
++  FOR_EACH_INTRINSIC_WEAKREF(F, I)                                \
++  FOR_EACH_INTRINSIC_WEB_TSAN(F, I)
+ 
+ #define FOR_EACH_THROWING_INTRINSIC(F)       \
+   FOR_EACH_THROWING_INTRINSIC_CLASSES(F, F)  \
+diff --git a/src/wasm/baseline/liftoff-compiler.cc b/src/wasm/baseline/liftoff-compiler.cc
+index 4c4f9cb116b..2911df5cf4b 100644
+--- a/src/wasm/baseline/liftoff-compiler.cc
++++ b/src/wasm/baseline/liftoff-compiler.cc
+@@ -3900,8 +3900,9 @@ class LiftoffCompiler {
+ 
+   void TraceMemoryOperation(bool is_store, uint32_t mem_index,
+                             MachineRepresentation rep, Register index,
+-                            uintptr_t offset, WasmCodePosition position) {
+-    DCHECK(v8_flags.trace_wasm_memory);
++                            uintptr_t offset, WasmCodePosition position,
++                            bool is_atomic = false) {
++    DCHECK(v8_flags.trace_wasm_memory || v8_flags.wasm_tsan);
+     SCOPED_CODE_COMMENT("TraceMemoryOperation");
+     // Before making the runtime call, spill all cache registers.
+     __ SpillAllRegisters();
+@@ -3958,6 +3959,9 @@ class LiftoffCompiler {
+     __ LoadConstant(data, WasmValue(static_cast<int>(rep)));
+     __ Store(info.gp(), no_reg, offsetof(MemoryTracingInfo, mem_rep), data,
+              StoreType::kI32Store8, pinned);
++    __ LoadConstant(data, WasmValue(is_atomic ? 1 : 0));
++    __ Store(info.gp(), no_reg, offsetof(MemoryTracingInfo, is_atomic), data,
++             StoreType::kI32Store8, pinned);
+ 
+     WasmTraceMemoryDescriptor descriptor;
+     DCHECK_EQ(0, descriptor.GetStackParameterCount());
+@@ -4111,7 +4115,8 @@ class LiftoffCompiler {
+       }
+     }
+ 
+-    if (V8_UNLIKELY(v8_flags.trace_wasm_memory)) {
++    if (V8_UNLIKELY(v8_flags.trace_wasm_memory) ||
++        V8_UNLIKELY(v8_flags.wasm_tsan && imm.memory->is_shared == SharedFlag::kYes)) {
+       TraceMemoryOperation(false, imm.mem_index,
+                            type.mem_type().representation(), index, offset,
+                            decoder->position());
+@@ -4155,7 +4160,8 @@ class LiftoffCompiler {
+     }
+     __ PushRegister(kS128, value);
+ 
+-    if (V8_UNLIKELY(v8_flags.trace_wasm_memory)) {
++    if (V8_UNLIKELY(v8_flags.trace_wasm_memory) ||
++        V8_UNLIKELY(v8_flags.wasm_tsan && imm.memory->is_shared == SharedFlag::kYes)) {
+       // Again load extend is different.
+       MachineRepresentation mem_rep =
+           transform == LoadTransformationKind::kExtend
+@@ -4203,7 +4209,8 @@ class LiftoffCompiler {
+ 
+     __ PushRegister(kS128, result);
+ 
+-    if (V8_UNLIKELY(v8_flags.trace_wasm_memory)) {
++    if (V8_UNLIKELY(v8_flags.trace_wasm_memory) ||
++        V8_UNLIKELY(v8_flags.wasm_tsan && imm.memory->is_shared == SharedFlag::kYes)) {
+       TraceMemoryOperation(false, imm.mem_index,
+                            type.mem_type().representation(), index, offset,
+                            decoder->position());
+@@ -4261,7 +4268,9 @@ class LiftoffCompiler {
+       // (important on ia32).
+       Register mem = pinned.set(GetMemoryStart(imm.mem_index, pinned));
+       LiftoffRegList outer_pinned;
+-      if (V8_UNLIKELY(v8_flags.trace_wasm_memory)) outer_pinned.set(index);
++      if (V8_UNLIKELY(v8_flags.trace_wasm_memory) ||
++          V8_UNLIKELY(v8_flags.wasm_tsan && imm.memory->is_shared == SharedFlag::kYes))
++        outer_pinned.set(index);
+       __ Store(mem, index, offset, value, type, outer_pinned,
+                &trapping_store_pc, true, i64_offset);
+       if (imm.memory->bounds_checks == kTrapHandler) {
+@@ -4269,7 +4278,8 @@ class LiftoffCompiler {
+       }
+     }
+ 
+-    if (V8_UNLIKELY(v8_flags.trace_wasm_memory)) {
++    if (V8_UNLIKELY(v8_flags.trace_wasm_memory) ||
++        V8_UNLIKELY(v8_flags.wasm_tsan && imm.memory->is_shared == SharedFlag::kYes)) {
+       TraceMemoryOperation(true, imm.mem_index, type.mem_rep(), index, offset,
+                            decoder->position());
+     }
+@@ -4308,7 +4318,8 @@ class LiftoffCompiler {
+         DefineSafepoint(trapping_store_pc);
+       }
+     }
+-    if (V8_UNLIKELY(v8_flags.trace_wasm_memory)) {
++    if (V8_UNLIKELY(v8_flags.trace_wasm_memory) ||
++        V8_UNLIKELY(v8_flags.wasm_tsan && imm.memory->is_shared == SharedFlag::kYes)) {
+       TraceMemoryOperation(true, imm.mem_index, type.mem_rep(), index, offset,
+                            decoder->position());
+     }
+@@ -5982,14 +5993,17 @@ class LiftoffCompiler {
+       CODE_COMMENT("atomic store");
+     }
+     Register addr = pinned.set(GetMemoryStart(imm.mem_index, pinned));
+-    if (V8_UNLIKELY(v8_flags.trace_wasm_memory) && index != no_reg) {
++    if ((V8_UNLIKELY(v8_flags.trace_wasm_memory) ||
++         V8_UNLIKELY(v8_flags.wasm_tsan && imm.memory->is_shared == SharedFlag::kYes)) &&
++        index != no_reg) {
+       outer_pinned.set(index);
+     }
+     __ AtomicStore(addr, index, offset, value, type, nullptr, imm.memory_order,
+                    outer_pinned, i64_offset);
+-    if (V8_UNLIKELY(v8_flags.trace_wasm_memory)) {
++    if (V8_UNLIKELY(v8_flags.trace_wasm_memory) ||
++        V8_UNLIKELY(v8_flags.wasm_tsan && imm.memory->is_shared == SharedFlag::kYes)) {
+       TraceMemoryOperation(true, imm.mem_index, type.mem_rep(), index, offset,
+-                           decoder->position());
++                           decoder->position(), /*is_atomic=*/true);
+     }
+   }
+ 
+@@ -6022,10 +6036,11 @@ class LiftoffCompiler {
+                   pinned, i64_offset);
+     __ PushRegister(kind, value);
+ 
+-    if (V8_UNLIKELY(v8_flags.trace_wasm_memory)) {
++    if (V8_UNLIKELY(v8_flags.trace_wasm_memory) ||
++        V8_UNLIKELY(v8_flags.wasm_tsan && imm.memory->is_shared == SharedFlag::kYes)) {
+       TraceMemoryOperation(false, imm.mem_index,
+                            type.mem_type().representation(), index, offset,
+-                           decoder->position());
++                           decoder->position(), /*is_atomic=*/true);
+     }
+   }
+ 
+@@ -6074,10 +6089,26 @@ class LiftoffCompiler {
+       CODE_COMMENT("atomic binop");
+     }
+ 
++    LiftoffRegList outer_pinned;
++    if ((V8_UNLIKELY(v8_flags.trace_wasm_memory) ||
++         V8_UNLIKELY(v8_flags.wasm_tsan &&
++                     imm.memory->is_shared == SharedFlag::kYes)) &&
++        index != no_reg) {
++      outer_pinned.set(index);
++    }
+     Register addr = pinned.set(GetMemoryStart(imm.mem_index, pinned));
+     (asm_.*emit_fn)(addr, index, offset, value, result, type, nullptr,
+                     i64_offset, LiftoffAssembler::kLittle);
+     __ PushRegister(result_kind, result);
++
++    if (V8_UNLIKELY(v8_flags.trace_wasm_memory) ||
++        V8_UNLIKELY(v8_flags.wasm_tsan &&
++                    imm.memory->is_shared == SharedFlag::kYes)) {
++      // Atomic RMW is both a load and a store; report as a store (is_atomic
++      // flag ensures only sync clocks are updated, not shadow memory).
++      TraceMemoryOperation(true, imm.mem_index, type.mem_rep(), index, offset,
++                           decoder->position(), /*is_atomic=*/true);
++    }
+   }
+ 
+   void AtomicCompareExchange(FullDecoder* decoder, StoreType type,
+@@ -6125,6 +6156,13 @@ class LiftoffCompiler {
+     __ AtomicCompareExchange(addr, no_reg, offset, expected, new_value, result,
+                              type, nullptr, i64_offset);
+     __ PushRegister(type.value_type().kind(), result);
++
++    if (V8_UNLIKELY(v8_flags.trace_wasm_memory) ||
++        V8_UNLIKELY(v8_flags.wasm_tsan &&
++                    imm.memory->is_shared == SharedFlag::kYes)) {
++      TraceMemoryOperation(true, imm.mem_index, type.mem_rep(), no_reg, offset,
++                           decoder->position(), /*is_atomic=*/true);
++    }
+     return;
+ #else
+     ValueKind result_kind = type.value_type().kind();
+@@ -6153,10 +6191,24 @@ class LiftoffCompiler {
+       CODE_COMMENT("atomic cmpxchg");
+     }
+ 
++    LiftoffRegList outer_pinned;
++    if ((V8_UNLIKELY(v8_flags.trace_wasm_memory) ||
++         V8_UNLIKELY(v8_flags.wasm_tsan &&
++                     imm.memory->is_shared == SharedFlag::kYes)) &&
++        index != no_reg) {
++      outer_pinned.set(index);
++    }
+     Register addr = pinned.set(GetMemoryStart(imm.mem_index, pinned));
+     __ AtomicCompareExchange(addr, index, offset, expected, new_value, result,
+                              type, nullptr, i64_offset);
+     __ PushRegister(result_kind, result);
++
++    if (V8_UNLIKELY(v8_flags.trace_wasm_memory) ||
++        V8_UNLIKELY(v8_flags.wasm_tsan &&
++                    imm.memory->is_shared == SharedFlag::kYes)) {
++      TraceMemoryOperation(true, imm.mem_index, type.mem_rep(), index, offset,
++                           decoder->position(), /*is_atomic=*/true);
++    }
+ #endif
+   }
+ 
+diff --git a/src/wasm/wasm-external-refs.cc b/src/wasm/wasm-external-refs.cc
+index 264d8d2bafa..35f610d2464 100644
+--- a/src/wasm/wasm-external-refs.cc
++++ b/src/wasm/wasm-external-refs.cc
+@@ -18,7 +18,9 @@
+ #include "src/execution/pointer-authentication.h"
+ #include "src/numbers/conversions.h"
+ #include "src/numbers/ieee754.h"
++#include "src/flags/flags.h"
+ #include "src/roots/roots-inl.h"
++#include "src/runtime/runtime-tsan.h"
+ #include "src/utils/memcopy.h"
+ #include "src/wasm/canonical-types.h"
+ #include "src/wasm/leb-helper.h"
+@@ -724,6 +726,34 @@ V ReadAndIncrementOffset(Address data, size_t* offset) {
+ 
+ constexpr int32_t kMemOpSuccess = 1;
+ constexpr int32_t kOutOfBounds = 0;
++
++// Report a bulk-memory region to WebTSan, sampled to bound cost. Only fires
++// when wasm_tsan is enabled and the memory is shared. Records up to 64 evenly
++// spaced single-byte accesses across [offset, offset+size).
++inline void MaybeReportTSanBulkRange(
++    Tagged<WasmTrustedInstanceData> trusted_data, uint32_t mem_index,
++    uintptr_t offset, uintptr_t size, bool is_write) {
++  if (V8_LIKELY(!v8_flags.wasm_tsan)) return;
++  if (size == 0) return;
++  auto& cb = v8::internal::web_tsan::g_callbacks;
++  if (!cb.record_range || !cb.get_current_tid) return;
++  auto memory_object = trusted_data->memory_object(mem_index);
++  auto backing = memory_object->backing_store();
++  if (!backing || !backing->is_shared()) return;
++  void* bs = backing->buffer_start();
++  size_t byte_length = backing->byte_length();
++  uint32_t tid = cb.get_current_tid();
++  if (tid == UINT32_MAX) return;
++  constexpr uintptr_t kMaxSamples = 64;
++  uintptr_t n = size < kMaxSamples ? size : kMaxSamples;
++  uintptr_t stride = size / n;
++  if (stride == 0) stride = 1;
++  for (uintptr_t i = 0; i < n; ++i) {
++    uintptr_t o = offset + i * stride;
++    if (o >= offset + size) break;
++    cb.record_range(bs, byte_length, o, 1, tid, is_write ? 1 : 0);
++  }
++}
+ }  // namespace
+ 
+ void data_drop_wrapper(Address trusted_data_addr, uint32_t segment_index) {
+@@ -772,8 +802,15 @@ int32_t memory_copy_wrapper(Address trusted_data_addr, uint32_t dst_mem_index,
+   if (!base::IsInBounds<size_t>(src, size, src_mem_size)) return kOutOfBounds;
+ 
+   // Use std::memmove, because the ranges can overlap.
+-  std::memmove(EffectiveAddress(trusted_data, dst_mem_index, dst),
+-               EffectiveAddress(trusted_data, src_mem_index, src), size);
++  uint8_t* dst_addr = EffectiveAddress(trusted_data, dst_mem_index, dst);
++  uint8_t* src_addr = EffectiveAddress(trusted_data, src_mem_index, src);
++
++  MaybeReportTSanBulkRange(trusted_data, src_mem_index, src, size,
++                           /*is_write=*/false);
++  MaybeReportTSanBulkRange(trusted_data, dst_mem_index, dst, size,
++                           /*is_write=*/true);
++
++  std::memmove(dst_addr, src_addr, size);
+   return kMemOpSuccess;
+ }
+ 
+@@ -787,6 +824,9 @@ int32_t memory_fill_wrapper(Address trusted_data_addr, uint32_t mem_index,
+   uint64_t mem_size = trusted_data->memory_size(mem_index);
+   if (!base::IsInBounds<uint64_t>(dst, size, mem_size)) return kOutOfBounds;
+ 
++  MaybeReportTSanBulkRange(trusted_data, mem_index, dst, size,
++                           /*is_write=*/true);
++
+   std::memset(EffectiveAddress(trusted_data, mem_index, dst), value, size);
+   return kMemOpSuccess;
+ }
+diff --git a/src/wasm/wasm-tracing.h b/src/wasm/wasm-tracing.h
+index 220507b1e74..2b33554c751 100644
+--- a/src/wasm/wasm-tracing.h
++++ b/src/wasm/wasm-tracing.h
+@@ -24,6 +24,7 @@ struct MemoryTracingInfo {
+   uint32_t mem_index;
+   uint8_t is_store;  // 0 or 1
+   uint8_t mem_rep;
++  uint8_t is_atomic;  // 0 or 1 — atomic ops only need sync clock updates
+   static_assert(std::is_same_v<decltype(mem_rep),
+                                std::underlying_type_t<MachineRepresentation>>,
+                 "MachineRepresentation uses uint8_t");

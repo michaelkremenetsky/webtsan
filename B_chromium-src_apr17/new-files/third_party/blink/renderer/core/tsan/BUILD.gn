@@ -1,0 +1,26 @@
+# Copyright 2026 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# WebTSan: Thread Sanitizer for SharedArrayBuffer-based threading.
+#
+# Build with: gn gen out/WebTSan --args='enable_web_tsan=true is_debug=true'
+# Run with:   chrome --enable-web-tsan --wasm-tsan --jitless <url>
+
+import("//third_party/blink/renderer/core/tsan/web_tsan.gni")
+
+if (enable_web_tsan) {
+  source_set("tsan") {
+    sources = [
+      "web_tsan.cc",
+      "web_tsan.h",
+      "web_tsan_hooks.h",
+      "web_tsan_init.cc",
+    ]
+
+    deps = [
+      "//base",
+      "//third_party/blink/renderer/core:core",
+    ]
+  }
+}

@@ -1,0 +1,283 @@
+diff --git a/content/browser/renderer_host/render_process_host_impl.cc b/content/browser/renderer_host/render_process_host_impl.cc
+index b0e9b70884..b9e0022d1f 100644
+--- a/content/browser/renderer_host/render_process_host_impl.cc
++++ b/content/browser/renderer_host/render_process_host_impl.cc
+@@ -3739,6 +3739,7 @@ void RenderProcessHostImpl::PropagateBrowserCommandLineToRenderer(
+   // Propagate the following switches to the renderer command line (along
+   // with any associated values) if present in the browser command line.
+   static const char* const kSwitchNames[] = {
++      "enable-web-tsan",
+       switches::kDisableInProcessStackTraces,
+       sandbox::policy::switches::kDisableLandlockSandbox,
+       sandbox::policy::switches::kDisableSeccompFilterSandbox,
+diff --git a/content/renderer/render_thread_impl.cc b/content/renderer/render_thread_impl.cc
+index 8d19385887..ea8252f4da 100644
+--- a/content/renderer/render_thread_impl.cc
++++ b/content/renderer/render_thread_impl.cc
+@@ -221,6 +221,7 @@
+ #include "base/test/clang_profiling.h"
+ #endif
+ 
++
+ namespace content {
+ 
+ namespace {
+diff --git a/third_party/blink/renderer/bindings/core/v8/local_window_proxy.cc b/third_party/blink/renderer/bindings/core/v8/local_window_proxy.cc
+index d293c49e67..3a8c856bfb 100644
+--- a/third_party/blink/renderer/bindings/core/v8/local_window_proxy.cc
++++ b/third_party/blink/renderer/bindings/core/v8/local_window_proxy.cc
+@@ -62,6 +62,7 @@
+ #include "third_party/blink/renderer/core/page/page.h"
+ #include "third_party/blink/renderer/core/probe/core_probes.h"
+ #include "third_party/blink/renderer/core/script/modulator.h"
++#include "third_party/blink/renderer/core/tsan/web_tsan_hooks.h"
+ #include "third_party/blink/renderer/platform/bindings/dom_wrapper_world.h"
+ #include "third_party/blink/renderer/platform/bindings/extensions_registry.h"
+ #include "third_party/blink/renderer/platform/bindings/origin_trial_features.h"
+@@ -215,6 +216,10 @@ void LocalWindowProxy::Initialize() {
+     GetFrame()->Client()->DidCreateScriptContext(context, world_->GetWorldId());
+   }
+ 
++  if (tsan::WebTSan::Get().IsEnabled()) {
++    tsan::InstallWebTSanGlobals(GetIsolate(), context);
++  }
++
+   InstallConditionalFeatures();
+ 
+   if (World().IsMainWorld()) {
+diff --git a/third_party/blink/renderer/controller/blink_initializer.cc b/third_party/blink/renderer/controller/blink_initializer.cc
+index 4d1f2acf58..8f9f89caa2 100644
+--- a/third_party/blink/renderer/controller/blink_initializer.cc
++++ b/third_party/blink/renderer/controller/blink_initializer.cc
+@@ -100,6 +100,9 @@
+ #endif
+ 
+ namespace blink {
++namespace tsan {
++void InitializeWebTSan();
++}  // namespace tsan
+ 
+ namespace {
+ 
+@@ -153,6 +156,9 @@ void InitializeCommon(Platform* platform, mojo::BinderMap* binders) {
+   // BlinkInitializer::Initialize() must be called before InitializeMainThread
+   GetBlinkInitializer().Initialize();
+ 
++  // Initialize WebTSan if --enable-web-tsan flag is present.
++  blink::tsan::InitializeWebTSan();
++
+   blink::V8Initializer::InitializeIsolateHolder(
+       blink::V8ContextSnapshot::GetReferenceTable(),
+       base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
+diff --git a/third_party/blink/renderer/core/BUILD.gn b/third_party/blink/renderer/core/BUILD.gn
+index e90757c296..aa8039a6c6 100644
+--- a/third_party/blink/renderer/core/BUILD.gn
++++ b/third_party/blink/renderer/core/BUILD.gn
+@@ -87,6 +87,7 @@ import("//third_party/blink/renderer/core/url/build.gni")
+ import("//third_party/blink/renderer/core/url_pattern/build.gni")
+ import("//third_party/blink/renderer/core/view_transition/build.gni")
+ import("//third_party/blink/renderer/core/workers/build.gni")
++import("//third_party/blink/renderer/core/tsan/build.gni")
+ import("//third_party/blink/renderer/core/xml/build.gni")
+ import("//third_party/blink/renderer/core/xmlhttprequest/build.gni")
+ import("//third_party/blink/renderer/platform/platform_generated.gni")
+@@ -359,6 +360,7 @@ component("core") {
+       rebase_path(blink_core_sources_xmlhttprequest, "", "xmlhttprequest")
+   sources += rebase_path(blink_core_sources_speech, "", "speech")
+   sources += rebase_path(blink_core_sources_preferences, "", "preferences")
++  sources += rebase_path(blink_core_sources_tsan, "", "tsan")
+ 
+   configs -= core_config_remove
+   configs += core_config_add
+diff --git a/third_party/blink/renderer/core/messaging/blink_transferable_message.h b/third_party/blink/renderer/core/messaging/blink_transferable_message.h
+index 497daf11d2..d9c79ee9d5 100644
+--- a/third_party/blink/renderer/core/messaging/blink_transferable_message.h
++++ b/third_party/blink/renderer/core/messaging/blink_transferable_message.h
+@@ -42,6 +42,9 @@ struct CORE_EXPORT BlinkTransferableMessage : BlinkCloneableMessage {
+       mojom::blink::DelegatedCapability::kNone;
+ 
+   std::optional<scheduler::TaskAttributionId> task_state_id;
++
++  // WebTSan: happens-before edge ID for race detection across postMessage.
++  uint64_t tsan_edge_id = 0;
+ };
+ 
+ CORE_EXPORT scoped_refptr<blink::StaticBitmapImage> ToStaticBitmapImage(
+diff --git a/third_party/blink/renderer/core/messaging/message_port.cc b/third_party/blink/renderer/core/messaging/message_port.cc
+index e61ead11b3..f9f6a2135f 100644
+--- a/third_party/blink/renderer/core/messaging/message_port.cc
++++ b/third_party/blink/renderer/core/messaging/message_port.cc
+@@ -61,6 +61,8 @@
+ #include "third_party/blink/renderer/platform/wtf/cross_thread_functional.h"
+ #include "third_party/blink/renderer/platform/wtf/text/atomic_string.h"
+ 
++#include "third_party/blink/renderer/core/tsan/web_tsan_hooks.h"
++
+ namespace blink {
+ 
+ MessagePort::MessagePort(ExecutionContext& execution_context)
+@@ -146,6 +148,8 @@ void MessagePort::postMessage(ScriptState* script_state,
+   msg.locked_to_sender_agent_cluster = msg.message->IsLockedToAgentCluster();
+   msg.task_state_id = std::nullopt;
+ 
++  msg.tsan_edge_id = tsan::OnPostMessageSend(tsan::WebTSanGetCurrentTid());
++
+   // Only pass the task state ID if we're in the main world, as isolated world
+   // task tracking is not yet supported. Also, only pass the task state if the
+   // port is still entangled to its initially entangled port.
+@@ -383,6 +387,9 @@ bool MessagePort::Accept(mojo::Message* mojo_message) {
+ }
+ 
+ void MessagePort::DispatchMessageEvent(BlinkTransferableMessage message) {
++  tsan::OnPostMessageReceive(tsan::WebTSanGetCurrentTid(),
++                             message.tsan_edge_id);
++
+   ExecutionContext* context = GetExecutionContext();
+   // WorkerGlobalScope::close() in Worker onmessage handler should prevent
+   // the next message from dispatching.
+diff --git a/third_party/blink/renderer/core/workers/dedicated_worker.cc b/third_party/blink/renderer/core/workers/dedicated_worker.cc
+index 7ea6daec53..2eac44da3b 100644
+--- a/third_party/blink/renderer/core/workers/dedicated_worker.cc
++++ b/third_party/blink/renderer/core/workers/dedicated_worker.cc
+@@ -65,6 +65,8 @@
+ #include "third_party/blink/renderer/platform/weborigin/security_policy.h"
+ #include "third_party/blink/renderer/platform/wtf/casting.h"
+ 
++#include "third_party/blink/renderer/core/tsan/web_tsan_hooks.h"
++
+ namespace blink {
+ 
+ DedicatedWorker* DedicatedWorker::Create(
+@@ -199,6 +201,9 @@ void DedicatedWorker::postMessage(ScriptState* script_state,
+           ->StoreCurrentStackTrace("Worker.postMessage");
+   uint64_t trace_id = base::trace_event::GetNextGlobalTraceId();
+   transferable_message.trace_id = trace_id;
++  transferable_message.tsan_edge_id =
++      tsan::OnPostMessageSend(tsan::WebTSanGetCurrentTid());
++
+   context_proxy_->PostMessageToWorkerGlobalScope(
+       std::move(transferable_message));
+   TRACE_EVENT_INSTANT(
+diff --git a/third_party/blink/renderer/core/workers/dedicated_worker_global_scope.cc b/third_party/blink/renderer/core/workers/dedicated_worker_global_scope.cc
+index 532de91e55..70f30fea36 100644
+--- a/third_party/blink/renderer/core/workers/dedicated_worker_global_scope.cc
++++ b/third_party/blink/renderer/core/workers/dedicated_worker_global_scope.cc
+@@ -73,6 +73,8 @@
+ #include "third_party/blink/renderer/platform/weborigin/security_policy.h"
+ #include "third_party/perfetto/include/perfetto/tracing/track.h"
+ 
++#include "third_party/blink/renderer/core/tsan/web_tsan_hooks.h"
++
+ namespace blink {
+ 
+ // static
+@@ -449,6 +451,9 @@ void DedicatedWorkerGlobalScope::postMessage(ScriptState* script_state,
+       WorkerThreadDebugger::From(script_state->GetIsolate());
+   transferable_message.sender_stack_trace_id =
+       debugger->StoreCurrentStackTrace("postMessage");
++  transferable_message.tsan_edge_id =
++      tsan::OnPostMessageSend(tsan::WebTSanGetCurrentTid());
++
+   WorkerObjectProxy().PostMessageToWorkerObject(
+       std::move(transferable_message));
+ 
+diff --git a/third_party/blink/renderer/core/workers/dedicated_worker_messaging_proxy.cc b/third_party/blink/renderer/core/workers/dedicated_worker_messaging_proxy.cc
+index eb0ef6222f..2e7eece175 100644
+--- a/third_party/blink/renderer/core/workers/dedicated_worker_messaging_proxy.cc
++++ b/third_party/blink/renderer/core/workers/dedicated_worker_messaging_proxy.cc
+@@ -35,6 +35,8 @@
+ #include "third_party/blink/renderer/platform/wtf/wtf.h"
+ #include "third_party/perfetto/include/perfetto/tracing/track_event_args.h"
+ 
++#include "third_party/blink/renderer/core/tsan/web_tsan_hooks.h"
++
+ namespace blink {
+ 
+ DedicatedWorkerMessagingProxy::DedicatedWorkerMessagingProxy(
+@@ -275,6 +277,9 @@ void DedicatedWorkerMessagingProxy::PostMessageToWorkerObject(
+   if (!worker_object_ || AskedToTerminate())
+     return;
+ 
++  tsan::OnPostMessageReceive(tsan::WebTSanGetCurrentTid(),
++                             message.tsan_edge_id);
++
+   ThreadDebugger* debugger =
+       ThreadDebugger::From(GetExecutionContext()->GetIsolate());
+   GCedMessagePortArray* ports = MessagePort::EntanglePorts(
+diff --git a/third_party/blink/renderer/core/workers/worker_global_scope.cc b/third_party/blink/renderer/core/workers/worker_global_scope.cc
+index 09cc0667b1..adb04a4cfe 100644
+--- a/third_party/blink/renderer/core/workers/worker_global_scope.cc
++++ b/third_party/blink/renderer/core/workers/worker_global_scope.cc
+@@ -96,6 +96,8 @@
+ #include "third_party/blink/renderer/platform/wtf/cross_thread_functional.h"
+ #include "third_party/perfetto/include/perfetto/tracing/track_event_args.h"
+ 
++#include "third_party/blink/renderer/core/tsan/web_tsan_hooks.h"
++
+ namespace blink {
+ namespace {
+ 
+@@ -596,6 +598,10 @@ void WorkerGlobalScope::RunWorkerScript() {
+ 
+ void WorkerGlobalScope::ReceiveMessage(BlinkTransferableMessage message) {
+   DCHECK(!IsContextPaused());
++
++  tsan::OnPostMessageReceive(tsan::WebTSanGetCurrentTid(),
++                             message.tsan_edge_id);
++
+   GCedMessagePortArray* ports =
+       MessagePort::EntanglePorts(*this, std::move(message.ports));
+   WorkerThreadDebugger* debugger =
+diff --git a/third_party/blink/renderer/core/workers/worker_thread.cc b/third_party/blink/renderer/core/workers/worker_thread.cc
+index ef25707a97..4c105f6ea0 100644
+--- a/third_party/blink/renderer/core/workers/worker_thread.cc
++++ b/third_party/blink/renderer/core/workers/worker_thread.cc
+@@ -74,6 +74,8 @@
+ #include "third_party/blink/renderer/platform/wtf/text/wtf_string.h"
+ #include "third_party/blink/renderer/platform/wtf/threading.h"
+ 
++#include "third_party/blink/renderer/core/tsan/web_tsan_hooks.h"
++
+ namespace blink {
+ 
+ using ExitCode = WorkerThread::ExitCode;
+@@ -688,11 +690,21 @@ void WorkerThread::InitializeOnWorkerThread(
+             WorkerThreadDebugger::From(GetIsolate()))
+       debugger->WorkerThreadCreated(this);
+ 
++    if (tsan::WebTSan::Get().IsEnabled()) {
++      uint32_t tid = tsan::OnWorkerCreate();
++      tsan::WebTSanSetCurrentTid(tid);
++    }
++
+     GlobalScope()->ScriptController()->Initialize(url_for_debugger);
+     GlobalScope()->WillBeginLoading();
+     v8::HandleScope handle_scope(GetIsolate());
+-    Platform::Current()->WorkerContextCreated(
+-        GlobalScope()->ScriptController()->GetContext());
++    v8::Local<v8::Context> worker_context =
++        GlobalScope()->ScriptController()->GetContext();
++    Platform::Current()->WorkerContextCreated(worker_context);
++
++    if (tsan::WebTSan::Get().IsEnabled()) {
++      tsan::InstallWebTSanGlobals(GetIsolate(), worker_context);
++    }
+ 
+     inspector_task_runner_->InitIsolate(GetIsolate());
+     SetThreadState(ThreadState::kRunning);
+@@ -825,6 +837,15 @@ void WorkerThread::PrepareForShutdownOnWorkerThread() {
+ 
+ void WorkerThread::PerformShutdownOnWorkerThread() {
+   DCHECK(IsCurrentThread());
++
++  {
++    uint32_t tid = tsan::WebTSanGetCurrentTid();
++    if (tid != UINT32_MAX) {
++      tsan::OnWorkerDestroy(tid);
++      tsan::WebTSanSetCurrentTid(UINT32_MAX);
++    }
++  }
++
+   {
+     base::AutoLock locker(lock_);
+     DCHECK_EQ(TerminationProgress::kPerforming, termination_progress_);

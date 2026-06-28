@@ -1,0 +1,9 @@
+ .../core/messaging/blink_transferable_message.h    |  8 +++++
+ .../blink/renderer/core/messaging/message_port.cc  | 30 +++++++++++++++++++
+ .../renderer/core/workers/dedicated_worker.cc      | 34 ++++++++++++++++++++++
+ .../blink/renderer/core/workers/dedicated_worker.h |  9 ++++++
+ .../core/workers/dedicated_worker_global_scope.cc  | 15 ++++++++++
+ .../workers/dedicated_worker_messaging_proxy.cc    | 14 +++++++++
+ .../renderer/core/workers/worker_global_scope.cc   | 17 +++++++++++
+ .../blink/renderer/core/workers/worker_thread.cc   | 33 +++++++++++++++++++++
+ 8 files changed, 160 insertions(+)

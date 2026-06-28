@@ -1,0 +1,5 @@
+source_path: /Users/michaelkremenetsky/Work/compiles/chromium
+base_commit: 9398c4a1fa432316ff8386b7eeccf6578951ae3d
+base_commit_subject: 9398c4a1fa Roll clank/internal/apps from 7efd54ab9625 to 51ce9ce41c86 (1 revision)
+branch: main
+captured_from_remote: https://github.com/chromium/chromium.git

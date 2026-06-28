@@ -1,0 +1,318 @@
+diff --git a/third_party/blink/renderer/core/messaging/blink_transferable_message.h b/third_party/blink/renderer/core/messaging/blink_transferable_message.h
+index 497daf11d2..b0e55157f1 100644
+--- a/third_party/blink/renderer/core/messaging/blink_transferable_message.h
++++ b/third_party/blink/renderer/core/messaging/blink_transferable_message.h
+@@ -42,6 +42,14 @@ struct CORE_EXPORT BlinkTransferableMessage : BlinkCloneableMessage {
+       mojom::blink::DelegatedCapability::kNone;
+ 
+   std::optional<scheduler::TaskAttributionId> task_state_id;
++
++#if defined(ENABLE_WEB_TSAN)
++  // WebTSan: happens-before edge ID for postMessage race detection.
++  // Set by the sender in postMessage(), consumed by the receiver in
++  // DispatchMessageEvent(). The edge carries the sender's vector clock
++  // snapshot so the receiver can establish a happens-after relationship.
++  uint64_t tsan_edge_id = 0;
++#endif
+ };
+ 
+ CORE_EXPORT scoped_refptr<blink::StaticBitmapImage> ToStaticBitmapImage(
+diff --git a/third_party/blink/renderer/core/messaging/message_port.cc b/third_party/blink/renderer/core/messaging/message_port.cc
+index e61ead11b3..903a476297 100644
+--- a/third_party/blink/renderer/core/messaging/message_port.cc
++++ b/third_party/blink/renderer/core/messaging/message_port.cc
+@@ -61,6 +61,10 @@
+ #include "third_party/blink/renderer/platform/wtf/cross_thread_functional.h"
+ #include "third_party/blink/renderer/platform/wtf/text/atomic_string.h"
+ 
++#if defined(ENABLE_WEB_TSAN)
++#include "third_party/blink/renderer/core/tsan/web_tsan_hooks.h"
++#endif
++
+ namespace blink {
+ 
+ MessagePort::MessagePort(ExecutionContext& execution_context)
+@@ -146,6 +150,19 @@ void MessagePort::postMessage(ScriptState* script_state,
+   msg.locked_to_sender_agent_cluster = msg.message->IsLockedToAgentCluster();
+   msg.task_state_id = std::nullopt;
+ 
++#if defined(ENABLE_WEB_TSAN)
++  // WebTSan: snapshot the sender's vector clock into a happens-before edge.
++  // The receiver will join this clock when the message is dispatched,
++  // establishing that all memory writes before this postMessage() are
++  // visible to the receiver after it processes the message.
++  {
++    uint32_t sender_tid = tsan::WebTSanGetCurrentTid();
++    if (sender_tid != UINT32_MAX) {
++      msg.tsan_edge_id = tsan::OnPostMessageSend(sender_tid);
++    }
++  }
++#endif
++
+   // Only pass the task state ID if we're in the main world, as isolated world
+   // task tracking is not yet supported. Also, only pass the task state if the
+   // port is still entangled to its initially entangled port.
+@@ -391,6 +408,19 @@ void MessagePort::DispatchMessageEvent(BlinkTransferableMessage message) {
+       return;
+   }
+ 
++#if defined(ENABLE_WEB_TSAN)
++  // WebTSan: consume the happens-before edge from the sender.
++  // This joins the sender's vector clock (snapshotted at postMessage time)
++  // into the receiver's clock, establishing that all memory operations
++  // performed by the sender before postMessage() are now visible to us.
++  {
++    uint32_t receiver_tid = tsan::WebTSanGetCurrentTid();
++    if (receiver_tid != UINT32_MAX && message.tsan_edge_id != 0) {
++      tsan::OnPostMessageReceive(receiver_tid, message.tsan_edge_id);
++    }
++  }
++#endif
++
+   Event* evt = CreateMessageEvent(message);
+   std::optional<scheduler::TaskAttributionTracker::TaskScope>
+       task_attribution_scope;
+diff --git a/third_party/blink/renderer/core/workers/dedicated_worker.cc b/third_party/blink/renderer/core/workers/dedicated_worker.cc
+index 7ea6daec53..89e9677df8 100644
+--- a/third_party/blink/renderer/core/workers/dedicated_worker.cc
++++ b/third_party/blink/renderer/core/workers/dedicated_worker.cc
+@@ -65,6 +65,10 @@
+ #include "third_party/blink/renderer/platform/weborigin/security_policy.h"
+ #include "third_party/blink/renderer/platform/wtf/casting.h"
+ 
++#if defined(ENABLE_WEB_TSAN)
++#include "third_party/blink/renderer/core/tsan/web_tsan_hooks.h"
++#endif
++
+ namespace blink {
+ 
+ DedicatedWorker* DedicatedWorker::Create(
+@@ -102,6 +106,12 @@ DedicatedWorker* DedicatedWorker::Create(
+       context, script_request_url, options);
+   worker->UpdateStateIfNeeded();
+   worker->Start();
++
++  // WebTSan: tid allocation happens in WorkerThread::InitializeOnWorkerThread()
++  // on the actual worker OS thread, where the TLS is also set. The
++  // DedicatedWorker::tsan_tid_ field is set later via a cross-thread callback.
++  // See worker_thread.cc for the initialization.
++
+   return worker;
+ }
+ 
+@@ -145,6 +155,15 @@ DedicatedWorker::~DedicatedWorker() = default;
+ 
+ void DedicatedWorker::Dispose() {
+   DCHECK(!GetExecutionContext() || GetExecutionContext()->IsContextThread());
++
++#if defined(ENABLE_WEB_TSAN)
++  // WebTSan: release the thread ID back to the pool.
++  if (tsan_tid_ != UINT32_MAX) {
++    tsan::OnWorkerDestroy(tsan_tid_);
++    tsan_tid_ = UINT32_MAX;
++  }
++#endif
++
+   context_proxy_->ParentObjectDestroyed();
+   factory_client_.reset();
+ }
+@@ -199,6 +218,21 @@ void DedicatedWorker::postMessage(ScriptState* script_state,
+           ->StoreCurrentStackTrace("Worker.postMessage");
+   uint64_t trace_id = base::trace_event::GetNextGlobalTraceId();
+   transferable_message.trace_id = trace_id;
++
++#if defined(ENABLE_WEB_TSAN)
++  // WebTSan: snapshot happens-before edge on worker.postMessage().
++  // This covers the DedicatedWorker path (parent -> worker) which is
++  // separate from the MessagePort path. Without this, synchronization
++  // via worker.postMessage() would be invisible to the race detector.
++  {
++    uint32_t sender_tid = tsan::WebTSanGetCurrentTid();
++    if (sender_tid != UINT32_MAX) {
++      transferable_message.tsan_edge_id =
++          tsan::OnPostMessageSend(sender_tid);
++    }
++  }
++#endif
++
+   context_proxy_->PostMessageToWorkerGlobalScope(
+       std::move(transferable_message));
+   TRACE_EVENT_INSTANT(
+diff --git a/third_party/blink/renderer/core/workers/dedicated_worker.h b/third_party/blink/renderer/core/workers/dedicated_worker.h
+index 0100c822e7..93831393f3 100644
+--- a/third_party/blink/renderer/core/workers/dedicated_worker.h
++++ b/third_party/blink/renderer/core/workers/dedicated_worker.h
+@@ -240,6 +240,15 @@ class CORE_EXPORT DedicatedWorker final
+   // The origin used by this dedicated worker on the renderer side, calculated
+   // from the browser side.
+   scoped_refptr<SecurityOrigin> origin_;
++
++#if defined(ENABLE_WEB_TSAN)
++  // WebTSan thread ID for this worker. Assigned during Create(),
++  // released during Dispose(). UINT32_MAX = not assigned.
++  uint32_t tsan_tid_ = UINT32_MAX;
++ public:
++  uint32_t GetTSanTid() const { return tsan_tid_; }
++ private:
++#endif
+ };
+ 
+ }  // namespace blink
+diff --git a/third_party/blink/renderer/core/workers/dedicated_worker_global_scope.cc b/third_party/blink/renderer/core/workers/dedicated_worker_global_scope.cc
+index 532de91e55..e7c3989504 100644
+--- a/third_party/blink/renderer/core/workers/dedicated_worker_global_scope.cc
++++ b/third_party/blink/renderer/core/workers/dedicated_worker_global_scope.cc
+@@ -73,6 +73,10 @@
+ #include "third_party/blink/renderer/platform/weborigin/security_policy.h"
+ #include "third_party/perfetto/include/perfetto/tracing/track.h"
+ 
++#if defined(ENABLE_WEB_TSAN)
++#include "third_party/blink/renderer/core/tsan/web_tsan_hooks.h"
++#endif
++
+ namespace blink {
+ 
+ // static
+@@ -449,6 +453,17 @@ void DedicatedWorkerGlobalScope::postMessage(ScriptState* script_state,
+       WorkerThreadDebugger::From(script_state->GetIsolate());
+   transferable_message.sender_stack_trace_id =
+       debugger->StoreCurrentStackTrace("postMessage");
++#if defined(ENABLE_WEB_TSAN)
++  // WebTSan: worker -> parent postMessage also needs a happens-before edge.
++  {
++    uint32_t sender_tid = tsan::WebTSanGetCurrentTid();
++    if (sender_tid != UINT32_MAX) {
++      transferable_message.tsan_edge_id =
++          tsan::OnPostMessageSend(sender_tid);
++    }
++  }
++#endif
++
+   WorkerObjectProxy().PostMessageToWorkerObject(
+       std::move(transferable_message));
+ 
+diff --git a/third_party/blink/renderer/core/workers/dedicated_worker_messaging_proxy.cc b/third_party/blink/renderer/core/workers/dedicated_worker_messaging_proxy.cc
+index eb0ef6222f..7bb04016e7 100644
+--- a/third_party/blink/renderer/core/workers/dedicated_worker_messaging_proxy.cc
++++ b/third_party/blink/renderer/core/workers/dedicated_worker_messaging_proxy.cc
+@@ -35,6 +35,10 @@
+ #include "third_party/blink/renderer/platform/wtf/wtf.h"
+ #include "third_party/perfetto/include/perfetto/tracing/track_event_args.h"
+ 
++#if defined(ENABLE_WEB_TSAN)
++#include "third_party/blink/renderer/core/tsan/web_tsan_hooks.h"
++#endif
++
+ namespace blink {
+ 
+ DedicatedWorkerMessagingProxy::DedicatedWorkerMessagingProxy(
+@@ -275,6 +279,16 @@ void DedicatedWorkerMessagingProxy::PostMessageToWorkerObject(
+   if (!worker_object_ || AskedToTerminate())
+     return;
+ 
++#if defined(ENABLE_WEB_TSAN)
++  // WebTSan: consume happens-before edge from worker -> parent postMessage.
++  {
++    uint32_t receiver_tid = tsan::WebTSanGetCurrentTid();
++    if (receiver_tid != UINT32_MAX && message.tsan_edge_id != 0) {
++      tsan::OnPostMessageReceive(receiver_tid, message.tsan_edge_id);
++    }
++  }
++#endif
++
+   ThreadDebugger* debugger =
+       ThreadDebugger::From(GetExecutionContext()->GetIsolate());
+   GCedMessagePortArray* ports = MessagePort::EntanglePorts(
+diff --git a/third_party/blink/renderer/core/workers/worker_global_scope.cc b/third_party/blink/renderer/core/workers/worker_global_scope.cc
+index 09cc0667b1..e4a5bf7e1d 100644
+--- a/third_party/blink/renderer/core/workers/worker_global_scope.cc
++++ b/third_party/blink/renderer/core/workers/worker_global_scope.cc
+@@ -96,6 +96,10 @@
+ #include "third_party/blink/renderer/platform/wtf/cross_thread_functional.h"
+ #include "third_party/perfetto/include/perfetto/tracing/track_event_args.h"
+ 
++#if defined(ENABLE_WEB_TSAN)
++#include "third_party/blink/renderer/core/tsan/web_tsan_hooks.h"
++#endif
++
+ namespace blink {
+ namespace {
+ 
+@@ -596,6 +600,19 @@ void WorkerGlobalScope::RunWorkerScript() {
+ 
+ void WorkerGlobalScope::ReceiveMessage(BlinkTransferableMessage message) {
+   DCHECK(!IsContextPaused());
++
++#if defined(ENABLE_WEB_TSAN)
++  // WebTSan: consume the happens-before edge from worker.postMessage().
++  // This is the receiver side for the DedicatedWorker message path
++  // (distinct from the MessagePort path which is handled in message_port.cc).
++  {
++    uint32_t receiver_tid = tsan::WebTSanGetCurrentTid();
++    if (receiver_tid != UINT32_MAX && message.tsan_edge_id != 0) {
++      tsan::OnPostMessageReceive(receiver_tid, message.tsan_edge_id);
++    }
++  }
++#endif
++
+   GCedMessagePortArray* ports =
+       MessagePort::EntanglePorts(*this, std::move(message.ports));
+   WorkerThreadDebugger* debugger =
+diff --git a/third_party/blink/renderer/core/workers/worker_thread.cc b/third_party/blink/renderer/core/workers/worker_thread.cc
+index ef25707a97..ffe84649ef 100644
+--- a/third_party/blink/renderer/core/workers/worker_thread.cc
++++ b/third_party/blink/renderer/core/workers/worker_thread.cc
+@@ -74,6 +74,10 @@
+ #include "third_party/blink/renderer/platform/wtf/text/wtf_string.h"
+ #include "third_party/blink/renderer/platform/wtf/threading.h"
+ 
++#if defined(ENABLE_WEB_TSAN)
++#include "third_party/blink/renderer/core/tsan/web_tsan_hooks.h"
++#endif
++
+ namespace blink {
+ 
+ using ExitCode = WorkerThread::ExitCode;
+@@ -688,6 +692,23 @@ void WorkerThread::InitializeOnWorkerThread(
+             WorkerThreadDebugger::From(GetIsolate()))
+       debugger->WorkerThreadCreated(this);
+ 
++#if defined(ENABLE_WEB_TSAN)
++    // WebTSan: set this worker thread's TSan thread ID in thread-local storage.
++    // The tid was assigned on the parent thread during DedicatedWorker::Create()
++    // and passed here via global_scope_creation_params. Since each Worker runs
++    // on its own OS thread, a thread_local gives us correct per-worker identity.
++    //
++    // TODO: Plumb tsan_tid through GlobalScopeCreationParams. For now, we
++    // allocate a fresh tid here — this works but means the tid in
++    // DedicatedWorker::tsan_tid_ and the TLS won't match. To fix this,
++    // add a uint32_t tsan_tid field to GlobalScopeCreationParams and set
++    // it in DedicatedWorker::CreateGlobalScopeCreationParams().
++    if (tsan::WebTSan::Get().IsEnabled()) {
++      uint32_t tid = tsan::WebTSan::Get().ThreadCreate();
++      tsan::WebTSanSetCurrentTid(tid);
++    }
++#endif
++
+     GlobalScope()->ScriptController()->Initialize(url_for_debugger);
+     GlobalScope()->WillBeginLoading();
+     v8::HandleScope handle_scope(GetIsolate());
+@@ -825,6 +846,18 @@ void WorkerThread::PrepareForShutdownOnWorkerThread() {
+ 
+ void WorkerThread::PerformShutdownOnWorkerThread() {
+   DCHECK(IsCurrentThread());
++
++#if defined(ENABLE_WEB_TSAN)
++  // WebTSan: release this worker's TSan thread ID and clear the TLS.
++  {
++    uint32_t tid = tsan::WebTSanGetCurrentTid();
++    if (tid != UINT32_MAX) {
++      tsan::WebTSan::Get().ThreadDestroy(tid);
++      tsan::WebTSanSetCurrentTid(UINT32_MAX);
++    }
++  }
++#endif
++
+   {
+     base::AutoLock locker(lock_);
+     DCHECK_EQ(TerminationProgress::kPerforming, termination_progress_);

@@ -1,0 +1,10 @@
+BUILD.gn
+src/builtins/builtins-sharedarraybuffer-gen.cc
+src/execution/futex-emulation.cc
+src/flags/flag-definitions.h
+src/objects/backing-store.cc
+src/runtime/runtime-test-wasm.cc
+src/runtime/runtime.h
+src/wasm/baseline/liftoff-compiler.cc
+src/wasm/wasm-external-refs.cc
+src/wasm/wasm-tracing.h
