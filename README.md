@@ -10,7 +10,7 @@ Approaches to getting the LLVM ThreadSanitizer running in the browser failed bec
 * **There is nothing to hook** - the primitives that actually create happens-before edges (Atomics.wait/notify, postMessage, Worker lifecycle) execute in the engine and browser, below the module's view.
 
 
-WebTSan fixes these issues by going a layer deeper and implementing the ThreadSantizer in the browser itself bypassing these limitations.
+WebTSan fixes these issues by going a layer deeper and implementing the data-race detection in the browser itself bypassing these limitations.
 
 ## Status
 
