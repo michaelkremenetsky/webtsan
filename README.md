@@ -6,8 +6,7 @@ lives in the renderer process and understands the web's threading primitives.
 
 ## Status
 
-Research prototype. It compiles and runs against the pinned revisions below,
-but it is not production-quality: max 64 logical threads, 2 shadow cells per
+Research prototype. It compiles and runs on real apps, but it is not production-quality: likely has false postives, max 64 logical threads, 2 shadow cells per
 byte (vs. TSan's 4), and some JIT tiers like turbofan are disabled for now.
 
 Main issue with practical use is real world WASM libcs like emscripten and wasi-libc need to be patched as they currently caused a lot of false postives. This is where most of the work left is and its the hardest 70%.
