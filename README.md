@@ -4,6 +4,15 @@ A patch set for Chromium and V8 that adds **data-race detection for
 SharedArrayBuffer-based web concurrency** — a simplified ThreadSanitizer that
 lives in the renderer process and understands the web's threading primitives.
 
+## Status
+
+Research prototype. It compiles and runs against the pinned revisions below,
+but it is not production-quality: max 64 logical threads, 2 shadow cells per
+byte (vs. TSan's 4), and only the instrumented execution paths are covered
+(e.g. TurboFan-compiled Wasm is excluded by design via tier-up suppression).
+
+Main issue with practical use is real world WASM libcs like emscripten and wasi-libc need to be patched as they currently caused a lot of false postives. This is where most of the work left is and its the hardest 70%.
+
 ## How it works
 
 Native TSan can't see web-level races: to the OS, a `SharedArrayBuffer` is just
@@ -33,15 +42,6 @@ On the V8 side, a new `src/runtime/runtime-tsan.{cc,h}` exposes a callback
 table that Blink registers at startup (so hooks work across the component-build
 dylib boundary), and hooks are threaded through the futex emulation, the
 SharedArrayBuffer builtins, and the Liftoff Wasm compiler.
-
-## Status
-
-Research prototype. It compiles and runs against the pinned revisions below,
-but it is not production-quality: max 64 logical threads, 2 shadow cells per
-byte (vs. TSan's 4), and only the instrumented execution paths are covered
-(e.g. TurboFan-compiled Wasm is excluded by design via tier-up suppression).
-
-Main issue with practical use is real world WASM libcs like emscripten and wasi-libc need to be patched as they currently caused a lot of false postives. This is where most of the work left is and its the hardest 70%.
 
 ## Applying the patches and building
 
