@@ -34,11 +34,6 @@ table that Blink registers at startup (so hooks work across the component-build
 dylib boundary), and hooks are threaded through the futex emulation, the
 SharedArrayBuffer builtins, and the Liftoff Wasm compiler.
 
-`docs/PATCHES.md` is the original design doc walking through every upstream
-edit with before/after diffs. It was written against an earlier iteration, so
-the final code in `patches/` diverges in places, but the architecture it
-describes still holds.
-
 ## Status
 
 Research prototype. It compiles and runs against the pinned revisions below,
