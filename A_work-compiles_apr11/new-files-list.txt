@@ -1,7 +1,0 @@
-third_party/blink/renderer/core/tsan/BUILD.gn
-third_party/blink/renderer/core/tsan/PATCHES.md
-third_party/blink/renderer/core/tsan/web_tsan.cc
-third_party/blink/renderer/core/tsan/web_tsan.h
-third_party/blink/renderer/core/tsan/web_tsan_hooks.h
-third_party/blink/renderer/core/tsan/web_tsan_init.cc
-third_party/blink/renderer/core/tsan/web_tsan_test.cc

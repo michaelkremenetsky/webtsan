@@ -1,8 +1,0 @@
-third_party/blink/renderer/core/messaging/blink_transferable_message.h
-third_party/blink/renderer/core/messaging/message_port.cc
-third_party/blink/renderer/core/workers/dedicated_worker.cc
-third_party/blink/renderer/core/workers/dedicated_worker.h
-third_party/blink/renderer/core/workers/dedicated_worker_global_scope.cc
-third_party/blink/renderer/core/workers/dedicated_worker_messaging_proxy.cc
-third_party/blink/renderer/core/workers/worker_global_scope.cc
-third_party/blink/renderer/core/workers/worker_thread.cc

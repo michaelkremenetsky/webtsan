@@ -1,5 +1,5 @@
-source_path: /Users/michaelkremenetsky/chromium/src
+repo: chromium/src
 base_commit: 4250fd77673f56c0dacc7c167117b51512385865
 base_commit_subject: 4250fd7767 Roll ios_internal from 89f382f232d4 to 600cb7a6c37e
 branch: main
-captured_from_remote: https://chromium.googlesource.com/chromium/src.git
+remote: https://chromium.googlesource.com/chromium/src.git
