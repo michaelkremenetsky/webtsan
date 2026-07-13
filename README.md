@@ -51,16 +51,6 @@ byte (vs. TSan's 4), and only the instrumented execution paths are covered
 See [docs/BUILDING.md](docs/BUILDING.md) for the pinned Chromium/V8 base
 revisions, how to apply the patches to a fresh checkout, and build/run flags.
 
-## Standalone core test
-
-The detector's vector-clock/shadow-memory logic can be tested without a
-Chromium checkout:
-
-```sh
-c++ -std=c++17 -DSTANDALONE_TEST tests/web_tsan_test.cc -o web_tsan_test
-./web_tsan_test
-```
-
 ## License
 
 BSD 3-Clause — see [LICENSE](LICENSE). The patches and the copied files under
