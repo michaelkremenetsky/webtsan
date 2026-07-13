@@ -4,6 +4,8 @@ A patch set for Chromium and V8 that adds **data-race detection for
 SharedArrayBuffer-based web concurrency** — a simplified ThreadSanitizer that
 lives in the renderer process and understands the web's threading primitives.
 
+## How it works
+
 Native TSan can't see web-level races: to the OS, a `SharedArrayBuffer` is just
 memory, and `postMessage`/`Atomics.wait` are opaque. WebTSan wires
 happens-before edges through the primitives web apps actually synchronize with:
@@ -15,8 +17,6 @@ happens-before edges through the primitives web apps actually synchronize with:
   instrumented (`--wasm_tsan` disables tier-up so all Wasm stays in Liftoff).
 - **Blink** — `postMessage` send/receive happens-before edges, and Worker
   lifecycle (logical thread ID assignment/release).
-
-## How it works
 
 The core detector is a new Blink module,
 `third_party/blink/renderer/core/tsan/`:
