@@ -46,6 +46,8 @@ but it is not production-quality: max 64 logical threads, 2 shadow cells per
 byte (vs. TSan's 4), and only the instrumented execution paths are covered
 (e.g. TurboFan-compiled Wasm is excluded by design via tier-up suppression).
 
+Main issue with practical use is real world WASM libcs like emscripten and wasi-libc need to be patched as they currently caused a lot of false postives. This is where most of the work left is and its the hardest 70%.
+
 ## Applying the patches and building
 
 See [docs/BUILDING.md](docs/BUILDING.md) for the pinned Chromium/V8 base
