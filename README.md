@@ -7,9 +7,9 @@ lives in the renderer process and understands the web's threading primitives.
 ## How it works
 
 Approaches to getting the LLVM ThreadSanitizer running in the browser failed because:
-* **It runs out of memory** - ThreadSanitizer typically increases an application's memory usage by about 5x to 10x. This would make most real-world applications blow past the 4GB wasm32 memory limit.
-* **Half the race is outside Wasm** - Most WASM applications have FFI calls to JS code, which a pure WASM approach wouldn't be able to instrument, so it misses races and reports false ones.
-* **There is nothing to hook** - the primitives that actually create happens-before edges (Atomics.wait/notify, postMessage, Worker lifecycle) execute in the engine and browser, below the module's view.
+* ThreadSanitizer typically increases an application's memory usage by about 5x to 10x. This would make most real-world applications blow past the 4GB wasm32 memory limit.
+* Most WASM applications have FFI calls to JS code, which a pure WASM approach wouldn't be able to instrument, so it misses races and reports false ones.
+* the primitives that actually create happens-before edges (Atomics.wait/notify, postMessage, Worker lifecycle) execute in the engine and browser, below the module's view.
 
 WebTSan fixes these issues by going a layer deeper and implementing the data-race detection in the browser itself bypassing these limitations.
 
