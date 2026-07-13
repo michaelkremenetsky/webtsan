@@ -4,13 +4,6 @@ A patch set for Chromium and V8 that adds **data-race detection for
 SharedArrayBuffer-based web concurrency** — a simplified ThreadSanitizer that
 lives in the renderer process and understands the web's threading primitives.
 
-## Status
-
-Research prototype. It compiles and runs on real apps, but it is not production-quality: likely has false postives, max 64 logical threads, 2 shadow cells per
-byte (vs. TSan's 4), and some JIT tiers like turbofan are disabled for now.
-
-Main issue with practical use is real-world WASM libcs like emscripten and wasi-libc need to be patched as they currently cause a lot of false positives because they are not written with being run through a thread sanitizer in mind. This is where most of the work is left, and it's the hardest 70%.
-
 ## How it works
 
 Approaches to getting the LLVM ThreadSanitizer running in the browser failed because:
@@ -27,6 +20,13 @@ happens-before edges through the primitives web apps actually synchronize with
 races with vector clocks and shadow memory.
 
 See [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) for the full architecture.
+
+## Status
+
+Research prototype. It compiles and runs on real apps, but it is not production-quality: likely has false postives, max 64 logical threads, 2 shadow cells per
+byte (vs. TSan's 4), and some JIT tiers like turbofan are disabled for now.
+
+Main issue with practical use is real-world WASM libcs like emscripten and wasi-libc need to be patched as they currently cause a lot of false positives because they are not written with being run through a thread sanitizer in mind. This is where most of the work is left, and it's the hardest 70%.
 
 ## Applying the patches and building
 
